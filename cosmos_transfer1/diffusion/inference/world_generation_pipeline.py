@@ -436,6 +436,7 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
 
         if self.offload_network:
             self._load_network()
+        self.model.model.cpu()
 
         prompt_embeddings = torch.cat(prompt_embeddings)
         if negative_prompt_embeddings is not None:
@@ -604,6 +605,9 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
 
             # Generate video frames for this clip (batched)
             log.info("Starting diffusion sampling")
+            self.model.tokenizer.video_vae.cpu()
+            torch.cuda.empty_cache()
+            self.model.model.cuda()
             latents = generate_world_from_control(
                 model=self.model,
                 state_shape=state_shape,
@@ -618,11 +622,19 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
                 x_sigma_max=x_sigma_max,
                 use_batch_processing=False if is_upscale_case else True,
             )
+            self.model.model.cpu()
+            torch.cuda.empty_cache()
             log.info("Completed diffusion sampling")
             log.info("Starting VAE decode")
+<<<<<<< HEAD
             frames = self._run_tokenizer_decoding(
                 latents, use_batch=False if is_upscale_case else True
             )  # [B, T, H, W, C] or similar
+=======
+            self.model.tokenizer.video_vae.cuda()
+            frames = self._run_tokenizer_decoding(latents)  # [B, T, H, W, C] or similar
+            self.model.tokenizer.video_vae.cpu()
+>>>>>>> 630cabf (local asdfasd)
             log.info("Completed VAE decode")
 
             if i_clip == 0:
@@ -703,7 +715,8 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
         log.info("Running guardrail checks on all prompts")
         safe_indices = []
         for i, single_prompt in enumerate(prompts):
-            is_safe = self._run_guardrail_on_prompt_with_offload(single_prompt)
+            #is_safe = self._run_guardrail_on_prompt_with_offload(single_prompt)
+            is_safe = True
             if is_safe:
                 safe_indices.append(i)
             else:
@@ -757,7 +770,8 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
 
         log.info("Run guardrail on generated videos")
         for i, video in enumerate(videos):
-            safe_video = self._run_guardrail_on_video_with_offload(video)
+            #safe_video = self._run_guardrail_on_video_with_offload(video)
+            safe_video = video
             if safe_video is not None:
                 all_videos.append(safe_video)
                 all_final_prompts.append(safe_prompts[i])

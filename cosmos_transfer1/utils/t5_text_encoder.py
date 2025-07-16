@@ -36,8 +36,11 @@ class CosmosT5TextEncoder(torch.nn.Module):
         """
         super().__init__()
         try:
-            self.tokenizer = T5TokenizerFast.from_pretrained(cache_dir, cache_dir=cache_dir)
-            self.text_encoder = T5EncoderModel.from_pretrained(cache_dir, cache_dir=cache_dir).to(device)
+            #self.tokenizer = T5TokenizerFast.from_pretrained(cache_dir, cache_dir=cache_dir)
+            #self.text_encoder = T5EncoderModel.from_pretrained(cache_dir, cache_dir=cache_dir).to(device)
+            self.tokenizer = T5TokenizerFast.from_pretrained("/scratch/ola5/ct/cosmos-transfer1/checkpoints/text_encoder")
+            from mmgp import offload
+            self.text_encoder = offload.fast_load_transformers_model("/scratch/ola5/ct/cosmos-transfer1/checkpoints/text_encoder/T5XXLEncoder_11B_quanto_int8.safetensors").to(device)
         except Exception as e:
             log.warning(f"Failed to load T5 model using cache_dir '{cache_dir}', falling back to default location: {e}")
             self.tokenizer = T5TokenizerFast.from_pretrained(model_name)

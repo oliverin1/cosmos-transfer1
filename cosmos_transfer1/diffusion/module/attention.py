@@ -17,13 +17,86 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-import transformer_engine as te
+
+use_TE = False
+if use_TE:
+    import transformer_engine as te
 from einops import rearrange
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
-from transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention import DotProductAttention
-from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 
+if use_TE:
+    from transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention import DotProductAttention
+    from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
+else:
+    try:
+        from sageattention import sageattn, sageattn_varlen
+    except:
+        sageattn = None
+        sageattn_varlen = None
+        pass
+
+    try:
+        from flash_attn import flash_attn_func
+    except:
+        pass
+
+    try:
+        from xformers.ops import memory_efficient_attention
+    except:
+        pass
+
+    def get_attention_modes():
+        ret = ["sdpa"]
+        if flash_attn_func != None:
+            ret.append("flash")
+        if memory_efficient_attention != None:
+            ret.append("xformers")
+        if sageattn_varlen != None:
+            ret.append("sage")
+        return ret
+
+
+    def rms_norm(x, weight=None, eps=1e-6):
+        return torch.nn.functional.rms_norm(x, weight.shape, weight=weight, eps=eps)
+            
+    class RMSNorm(torch.nn.Module):
+        def __init__(
+            self, dim: int, elementwise_affine: bool = False, eps: float = 1e-6, device=None, dtype=None
+        ):
+            """
+            Initialize the RMSNorm normalization layer.
+            Args:
+                dim (int): The dimension of the input tensor.
+                eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
+            Attributes:
+                eps (float): A small value added to the denominator for numerical stability.
+                weight (nn.Parameter): Learnable scaling parameter.
+            """
+            super().__init__()
+            self.eps = eps
+            self.learnable_scale = elementwise_affine
+            if self.learnable_scale:
+                self.weight = nn.Parameter(torch.empty(dim, device=device, dtype=dtype))
+            else:
+                self.register_parameter("weight", None)
+
+        def forward(self, x):
+            return rms_norm(x, self.weight, self.eps)
+        
+    def apply_rotary_pos_emb(
+        t: torch.Tensor,
+        freqs: torch.Tensor,
+    ) -> torch.Tensor:
+        #   lambda t: rearrange(t, "s b (n c) -> b n s c", n=self.heads, c=self.dim_head),
+        
+        freqs = freqs
+        t_ = t.reshape(*t.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2)
+        t_out = freqs[..., 0] * t_[..., 0] + freqs[..., 1] * t_[..., 1]
+        t_out = t_out.movedim(-1, -2)
+        t_out = t_out.reshape(*t.shape).type_as(t)
+        return t_out
+        
 # ---------------------- Feed Forward Network -----------------------
 
 
@@ -125,11 +198,14 @@ def normalize(x: torch.Tensor, dim: Optional[List[int]] = None, eps: float = 0) 
     return x / norm.to(x.dtype)
 
 
-def get_normalization(name: str, channels: int):
+def get_normalization(name: str, channels: int, kwargs = {}):
     if name == "I":
         return nn.Identity()
     elif name == "R":
-        return te.pytorch.RMSNorm(channels, eps=1e-6)
+        if use_TE:
+            return te.pytorch.RMSNorm(channels, eps=1e-6)
+        else:
+            return RMSNorm(channels, elementwise_affine = True, eps=1e-6, **kwargs)
     else:
         raise ValueError(f"Normalization {name} not found")
 
@@ -368,28 +444,29 @@ class Attention(nn.Module):
             nn.Dropout(dropout),
         )
 
-        if attn_op:  # use what is given
-            self.attn_op = attn_op
-        elif self.backend == "transformer_engine":
-            self.attn_op: BaseAttentionOp = DotProductAttention(
-                self.heads,
-                self.dim_head,
-                num_gqa_groups=self.heads,
-                attention_dropout=0,
-                qkv_format=qkv_format,
-                attn_mask_type="no_mask",
-                sequence_parallel=False,
-            )
-            self.regional_attn_op = RegionalAttentionOp(
-                self.heads,
-                self.dim_head,
-                num_gqa_groups=self.heads,
-                attention_dropout=0,
-                qkv_format=qkv_format,
-                attn_mask_type="arbitrary",
-            )
-        else:
-            raise ValueError(f"Backend {backend} not found")
+        if use_TE:
+            if attn_op:  # use what is given
+                self.attn_op = attn_op
+            elif self.backend == "transformer_engine":
+                self.attn_op: BaseAttentionOp = DotProductAttention(
+                    self.heads,
+                    self.dim_head,
+                    num_gqa_groups=self.heads,
+                    attention_dropout=0,
+                    qkv_format=qkv_format,
+                    attn_mask_type="no_mask",
+                    sequence_parallel=False,
+                )
+                self.regional_attn_op = RegionalAttentionOp(
+                    self.heads,
+                    self.dim_head,
+                    num_gqa_groups=self.heads,
+                    attention_dropout=0,
+                    qkv_format=qkv_format,
+                    attn_mask_type="arbitrary",
+                )
+            else:
+                raise ValueError(f"Backend {backend} not found")
 
     def cal_qkv(
         self, x, context=None, mask=None, rope_emb=None, **kwargs
@@ -411,10 +488,16 @@ class Attention(nn.Module):
             context = x if context is None else context
             k = self.to_k[0](context)
             v = self.to_v[0](context)
-            q, k, v = map(
-                lambda t: rearrange(t, "b ... (n c) -> b ... n c", n=self.heads, c=self.dim_head),
-                (q, k, v),
-            )
+            if use_TE:
+                q, k, v = map(
+                    lambda t: rearrange(t, "b ... (n c) -> b ... n c", n=self.heads, c=self.dim_head),
+                    (q, k, v),
+                )
+            else:
+                q, k, v = map(
+                    lambda t: rearrange(t, "s b (n c) -> b n s c", n=self.heads, c=self.dim_head),
+                    (q, k, v),
+                )
         else:
             raise ValueError(f"Normalization mode {self.qkv_norm_mode} not found, only support 'per_head'")
 
@@ -422,20 +505,70 @@ class Attention(nn.Module):
         k = self.to_k[1](k)
         v = self.to_v[1](v)
         if self.is_selfattn and rope_emb is not None:  # only apply to self-attention!
-            q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=True)
-            k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=True)
+            if use_TE:
+                q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=True)
+                k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=True)
+            else:
+                #assert False
+                q = apply_rotary_pos_emb(q, rope_emb ) 
+                k = apply_rotary_pos_emb(k, rope_emb ) 
         return q, k, v
 
-    def cal_attn(self, q, k, v, mask=None):
-        if self.backend == "transformer_engine":
-            seq_dim = self.qkv_format.index("s")
-            assert (
-                q.shape[seq_dim] > 1 and k.shape[seq_dim] > 1
-            ), "Seqlen must be larger than 1 for TE Attention starting with 1.8 TE version."
-            out = self.attn_op(q, k, v, core_attention_bias_type="no_bias", core_attention_bias=None)  # [B, Mq, H, V]
-            return self.to_out(out)
+    def cal_attn(self, q, k, v, mask=None, cross_attn=False):
+        patch_compiler = False
+        if use_TE:
+            if self.backend == "transformer_engine":
+                seq_dim = self.qkv_format.index("s")
+                assert (
+                    q.shape[seq_dim] > 1 and k.shape[seq_dim] > 1
+                ), "Seqlen must be larger than 1 for TE Attention starting with 1.8 TE version."
+                out = self.attn_op(q, k, v, core_attention_bias_type="no_bias", core_attention_bias=None)  # [B, Mq, H, V]
+                return self.to_out(out)
+            else:
+                raise ValueError(f"Backend {self.backend} not found")
         else:
-            raise ValueError(f"Backend {self.backend} not found")
+            attention_mode = "xformers"
+            apply_patch = True
+            if attention_mode == "sage":
+                # b h k d
+                if patch_compiler:
+                    batch_no = q.shape[0]
+                    max_seqlen_q = q.shape[2]
+                    max_seqlen_k = k.shape[2]
+                    cu_seqlens_q = torch.tensor([0, max_seqlen_q], dtype= torch.int32, device="cuda")
+                    cu_seqlens_k = torch.tensor([0, max_seqlen_k], dtype= torch.int32, device="cuda")
+                    q, k, v = map(
+                        lambda x: x.transpose(1, 2).view(x.shape[0] * x.shape[2], x.shape[1], x.shape[-1] ),
+                        (q, k, v),
+                    )
+                    out= sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+                    out = out.view(
+                        batch_no, max_seqlen_q, out.shape[-2], out.shape[-1]
+                    ).transpose(1, 2)  
+                    apply_patch  = True
+                else:
+                    out = sageattn(q, k, v, attn_mask=mask, is_causal=False) # can't use this version of sage attension with compilation as it produces garbage 
+            elif attention_mode == "xformers":
+                # b h k d -> b k h d
+                q, k, v = map(
+                    lambda t: t.transpose(1, 2),
+                    (q, k, v),
+                )
+                out = memory_efficient_attention(q, k, v, attn_bias= mask)
+                # b k h d -> b h k d 
+                out = out.transpose(1, 2)
+                apply_patch  = cross_attn
+            elif attention_mode =="sdpa":
+                out = torch.nn.functional.scaled_dot_product_attention( q, k , v, attn_mask=mask, is_causal=False)
+                apply_patch  = cross_attn
+            else:
+                raise Exception("attention type not supported")
+        
+            out = rearrange(out, " b n s c -> s b (n c)")
+            if  patch_compiler and apply_patch: # patch for pytorch 2.50 / 2.51 compilation bug, many thanks to ... Deep Beep Meep,  wait !, is that me ?
+                out = out +  0 # out += 0 won't work as it doesn't seem to elicit the creation of a brand new tensor 
+            out = self.to_out(out) 
+        return out
 
     def forward(
         self,

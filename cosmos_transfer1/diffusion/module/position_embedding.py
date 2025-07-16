@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 
 import numpy as np
 import torch
@@ -21,11 +21,31 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import nn
 from torch.distributed import ProcessGroup, get_process_group_ranks
+import math
 
-from cosmos_transfer1.diffusion.module.attention import normalize
 from cosmos_transfer1.diffusion.module.parallel import split_inputs_cp
-from cosmos_transfer1.diffusion.module.timm import trunc_normal_
+use_TE = False
+if use_TE:
+    from cosmos_transfer1.diffusion.module.attention import normalize
+    from cosmos_transfer1.diffusion.module.timm import trunc_normal_
+else:
+    def normalize(x: torch.Tensor, dim: Optional[List[int]] = None, eps: float = 0) -> torch.Tensor:
+        """
+        Normalizes the input tensor along specified dimensions such that the average square norm of elements is adjusted.
 
+        Args:
+            x (torch.Tensor): The input tensor to normalize.
+            dim (list, optional): The dimensions over which to normalize. If None, normalizes over all dimensions except the first.
+            eps (float, optional): A small constant to ensure numerical stability during division.
+
+        Returns:
+            torch.Tensor: The normalized tensor.
+        """
+        if dim is None:
+            dim = list(range(1, x.ndim))
+        norm = torch.linalg.vector_norm(x, dim=dim, keepdim=True, dtype=torch.float32)
+        norm = torch.add(eps, norm, alpha=math.sqrt(norm.numel() / x.numel()))
+        return x / norm.to(x.dtype)
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -222,7 +242,7 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         temporal_freqs = 1.0 / (t_theta**self.dim_temporal_range)
 
         B, T, H, W, _ = B_T_H_W_C
-        uniform_fps = (fps is None) or (fps.min() == fps.max())
+        uniform_fps = (fps is None) or isinstance(fps, (int, float)) or (fps.min() == fps.max())
         assert (
             uniform_fps or B == 1 or T == 1
         ), "For video batch, batch size should be 1 for non-uniform fps. For image batch, T should be 1"
@@ -232,24 +252,46 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         half_emb_h = torch.outer(self.seq[:H], h_spatial_freqs)
         half_emb_w = torch.outer(self.seq[:W], w_spatial_freqs)
 
-        # apply sequence scaling in temporal dimension
-        if fps is None:  # image case
-            assert T == 1, "T should be 1 for image batch."
-            half_emb_t = torch.outer(self.seq[:T], temporal_freqs)
+        if use_TE:
+            # apply sequence scaling in temporal dimension
+            if fps is None:  # image case
+                assert T == 1, "T should be 1 for image batch."
+                half_emb_t = torch.outer(self.seq[:T], temporal_freqs)
+            else:
+                half_emb_t = torch.outer(self.seq[:T] / fps[:1] * self.base_fps, temporal_freqs)
+    
+            em_T_H_W_D = torch.cat(
+                [
+                    repeat(half_emb_t, "t d -> t h w d", h=H, w=W),
+                    repeat(half_emb_h, "h d -> t h w d", t=T, w=W),
+                    repeat(half_emb_w, "w d -> t h w d", t=T, h=H),
+                ]
+                * 2,
+                dim=-1,
+            )
+    
+            return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
         else:
-            half_emb_t = torch.outer(self.seq[:T] / fps[:1] * self.base_fps, temporal_freqs)
+            # apply sequence scaling in temporal dimension
+            if fps is None:  # image case
+                half_emb_t = torch.outer(self.seq[:T], temporal_freqs)
+            else:
+                half_emb_t = torch.outer(self.seq[:T] / fps * self.base_fps, temporal_freqs)
 
-        em_T_H_W_D = torch.cat(
-            [
-                repeat(half_emb_t, "t d -> t h w d", h=H, w=W),
-                repeat(half_emb_h, "h d -> t h w d", t=T, w=W),
-                repeat(half_emb_w, "w d -> t h w d", t=T, h=H),
-            ]
-            * 2,
-            dim=-1,
-        )
+            half_emb_h = torch.stack([torch.cos(half_emb_h), -torch.sin(half_emb_h), torch.sin(half_emb_h), torch.cos(half_emb_h)], dim=-1)
+            half_emb_w = torch.stack([torch.cos(half_emb_w), -torch.sin(half_emb_w), torch.sin(half_emb_w), torch.cos(half_emb_w)], dim=-1)
+            half_emb_t = torch.stack([torch.cos(half_emb_t), -torch.sin(half_emb_t), torch.sin(half_emb_t), torch.cos(half_emb_t)], dim=-1)
 
-        return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
+            em_T_H_W_D = torch.cat(
+                [
+                    repeat(half_emb_t, "t d x -> t h w d x", h=H, w=W),
+                    repeat(half_emb_h, "h d x -> t h w d x", t=T, w=W),
+                    repeat(half_emb_w, "w d x -> t h w d x", t=T, h=H),
+                ]
+                , dim=-2,
+            )
+
+            return rearrange(em_T_H_W_D, "t h w d (i j) -> (t h w) d i j", i=2, j=2).float()
 
 
 class LearnablePosEmbAxis(VideoPositionEmb):
@@ -272,13 +314,14 @@ class LearnablePosEmbAxis(VideoPositionEmb):
         self.interpolation = interpolation
         assert self.interpolation in ["crop"], f"Unknown interpolation method {self.interpolation}"
 
-        self.pos_emb_h = nn.Parameter(torch.zeros(len_h, model_channels))
-        self.pos_emb_w = nn.Parameter(torch.zeros(len_w, model_channels))
-        self.pos_emb_t = nn.Parameter(torch.zeros(len_t, model_channels))
+        self.pos_emb_h = nn.Parameter(torch.empty(len_h, model_channels))
+        self.pos_emb_w = nn.Parameter(torch.empty(len_w, model_channels))
+        self.pos_emb_t = nn.Parameter(torch.empty(len_t, model_channels))
 
-        trunc_normal_(self.pos_emb_h, std=0.02)
-        trunc_normal_(self.pos_emb_w, std=0.02)
-        trunc_normal_(self.pos_emb_t, std=0.02)
+        if use_TE:
+            trunc_normal_(self.pos_emb_h, std=0.02)
+            trunc_normal_(self.pos_emb_w, std=0.02)
+            trunc_normal_(self.pos_emb_t, std=0.02)
 
     def generate_embeddings(self, B_T_H_W_C: torch.Size, fps=Optional[torch.Tensor]) -> torch.Tensor:
         B, T, H, W, _ = B_T_H_W_C
